@@ -114,7 +114,6 @@ public class NetworkTransmission : NetworkBehaviour
         }
         else // 다른 클라이언트들에게는 알림 메시지만 표시
         {
-            // PlayerDataManager에서 해당 플레이어 정보 제거 (UI 갱신 트리거)
             if (PlayerDataManager.instance.GetPlayerInfo(kickedClientId) != null)
             {
                 PlayerDataManager.instance.RemovePlayer(kickedClientId);

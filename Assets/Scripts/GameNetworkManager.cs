@@ -20,6 +20,7 @@ public class GameNetworkManager : MonoBehaviour
     public static string DisconnectReason { get; private set; } = "";
     
     private readonly List<ulong> bannedSteamIds = new List<ulong>();
+    private bool isDisconnecting = false; // 중복 실행 방지를 위한 플래그
     
     [Header("Settings")]
     [SerializeField] private int maxPlayers = 4;
@@ -45,6 +46,7 @@ public class GameNetworkManager : MonoBehaviour
             {
                 Debug.Log(i+". "+bannedSteamIds[i]);
             }
+            Debug.Log(DisconnectReason);
         }
     }
 
@@ -55,8 +57,12 @@ public class GameNetworkManager : MonoBehaviour
         SteamMatchmaking.OnLobbyMemberLeave += OnLobbyMemberLeave;
         SteamFriends.OnGameLobbyJoinRequested += OnGameLobbyJoinRequested;
         
-        NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
-        NetworkManager.Singleton.OnClientDisconnectCallback += OnClientDisconnected;
+        // NetworkManager가 존재할 때만 콜백을 등록합니다.
+        if (NetworkManager.Singleton != null)
+        {
+            NetworkManager.Singleton.OnClientConnectedCallback += OnClientConnected;
+            NetworkManager.Singleton.OnClientDisconnectCallback += OnClientDisconnected;
+        }
     }
     
     private void OnDisable()
@@ -83,6 +89,8 @@ public class GameNetworkManager : MonoBehaviour
 
     public async void CreateLobby(string lobbyName, LobbyType lobbyType)
     {
+        // 새로운 연결을 시작하므로, Disconnecting 플래그를 리셋합니다.
+        isDisconnecting = false; 
         try
         {
             Debug.Log("Creating lobby...");
@@ -122,33 +130,45 @@ public class GameNetworkManager : MonoBehaviour
 
     public async void JoinLobby(Lobby lobby)
     {
+        // 새로운 연결을 시작하므로, Disconnecting 플래그를 리셋합니다.
+        isDisconnecting = false;
         if (await lobby.Join() != RoomEnter.Success)
         {
             Debug.LogError($"Failed to join lobby {lobby.Id}");
         }
     }
 
-    public async void JoinLobbyWithID(ulong lobbyId)
+    public void JoinLobbyWithID(ulong lobbyId)
     {
+        // 새로운 연결을 시작하므로, Disconnecting 플래그를 리셋합니다.
+        isDisconnecting = false;
         SteamMatchmaking.JoinLobbyAsync(lobbyId);
+    }
+    
+    public void LeaveLobbyIntentional()
+    {
+        SetDisconnectReason(""); // 이유를 비워서 메시지가 표시되지 않도록 함
+        Disconnect();
     }
     
     public void Disconnect()
     {
-        if (string.IsNullOrEmpty(DisconnectReason))
-        {
-            DisconnectReason = "You have disconnected from the lobby.";
-        }
+        // Disconnect가 이미 진행 중이면 중복 실행 방지
+        if (isDisconnecting) return;
+        isDisconnecting = true;
         
         CurrentLobby?.Leave();
         CurrentLobby = null;
         
-        if (NetworkManager.Singleton.IsConnectedClient || NetworkManager.Singleton.IsHost)
+        if (NetworkManager.Singleton != null && (NetworkManager.Singleton.IsConnectedClient || NetworkManager.Singleton.IsHost))
         {
             NetworkManager.Singleton.Shutdown();
         }
         
-        PlayerDataManager.instance.ClearAllData();
+        PlayerDataManager.instance?.ClearAllData();
+        
+        // isDisconnecting 플래그는 새로운 씬의 스크립트에서 리셋하거나
+        // 새로운 연결 시도(Create/Join) 시 리셋합니다.
         SceneManager.LoadScene("LobbySetupScene");
     }
     
@@ -156,10 +176,8 @@ public class GameNetworkManager : MonoBehaviour
     {
         DisconnectReason = reason;
     }
-
-    /// <summary>
-    /// 게임 시작 시 로비를 잠가 새로운 플레이어의 참가를 막습니다.
-    /// </summary>
+    
+    // 이 메소드는 그대로 유지됩니다.
     public void LockLobby()
     {
         if (NetworkManager.Singleton.IsHost && CurrentLobby.HasValue)
@@ -175,21 +193,23 @@ public class GameNetworkManager : MonoBehaviour
         {
             NetworkManager.Singleton.StartHost();
         }
-        else Disconnect();
+        else 
+        {
+            SetDisconnectReason("Failed to create lobby.");
+            Disconnect();
+        }
     }
 
     private void OnLobbyEntered(Lobby lobby)
     {
         CurrentLobby = lobby;
-
-        // 호스트가 아닌 클라이언트의 경우, 여기서 Netcode 클라이언트를 시작합니다.
+        
         if (!NetworkManager.Singleton.IsHost)
         {
             NetworkManager.Singleton.gameObject.GetComponent<FacepunchTransport>().targetSteamId = lobby.Owner.Id;
             NetworkManager.Singleton.StartClient();
         }
 
-        // 씬을 로드하고, 로드가 완료되면 환영 메시지를 표시하는 코루틴을 시작합니다.
         StartCoroutine(LoadLobbySceneAndNotify());
     }
     
@@ -208,24 +228,20 @@ public class GameNetworkManager : MonoBehaviour
     
     private IEnumerator LoadLobbySceneAndNotify()
     {
-        // LobbyScene을 비동기적으로 로드합니다.
         var loadOperation = SceneManager.LoadSceneAsync("LobbyScene");
-
-        // 씬 로드가 완료될 때까지 대기합니다.
         while (!loadOperation.isDone)
         {
             yield return null;
         }
-
-        // 씬 로드 후 모든 객체의 Awake, Start 함수가 호출되도록 한 프레임을 더 기다립니다. (안정성 확보)
         yield return new WaitForEndOfFrame();
-        
-        // 이제 ChatManager.instance가 확실히 존재하므로, 안전하게 메시지를 추가합니다.
         ChatManager.instance?.AddMessage("You have joined the lobby.", MessageType.PersonalSystem);
     }
 
     private void OnClientDisconnected(ulong clientId)
     {
+        // 이미 Disconnect 절차가 시작되었다면 아무것도 하지 않음
+        if (isDisconnecting) return;
+
         var playerInfo = PlayerDataManager.instance.GetPlayerInfo(clientId);
 
         if (NetworkManager.Singleton.IsHost) // 호스트: 떠난 클라이언트를 모두에게 알림
@@ -233,8 +249,18 @@ public class GameNetworkManager : MonoBehaviour
             if (playerInfo != null)
                 NetworkTransmission.instance.RemovePlayerClientRpc(clientId, playerInfo.SteamName);
         }
-        else // 클라이언트: 연결이 끊겼으므로 메인 메뉴로
+        else // 클라이언트: 비정상적으로 연결이 끊김
         {
+            // 클라이언트가 이 콜백을 받았다는 것은 연결이 강제로 끊겼다는 의미입니다.
+            // (추방, 호스트 이탈, 네트워크 문제 등)
+            // 이미 DisconnectReason이 설정되어 있지 않다면 (예: 추방 메시지),
+            // 일반적인 연결 끊김 메시지를 설정합니다.
+            if (string.IsNullOrEmpty(DisconnectReason))
+            {
+                SetDisconnectReason("Connection to the host was lost.");
+            }
+            
+            // 연결 종료 절차를 시작합니다.
             Disconnect();
         }
     }
